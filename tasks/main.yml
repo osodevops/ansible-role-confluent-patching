@@ -1,0 +1,157 @@
+---
+#
+#  This playbook does following tasks
+#  1. Start connect service if its not running
+#  2. Get the running connectors list
+#  3. Get the intended connectors list from ../files/{envname}/*json files
+#  4. Delete the running connectors which are not present in intended connectors list
+#  5. Submit the connectors using json payload files from location ../files/{envname}/
+#
+
+- name: Finding the services present on host
+  block:
+    - name: Validate existence of zookeeper service
+      stat:
+        path: /etc/systemd/system/zookeeper.service
+      register: zookeeper_service
+
+    - name: Validate existence of kafka service
+      stat:
+        path: /etc/systemd/system/kafka.service
+      register: kafka_service
+
+    - name: Validate existence of connect service
+      stat:
+        path: /etc/systemd/system/connect.service
+      register: connect_service
+
+    - name: Validate existence of control center service
+      stat:
+        path: /etc/systemd/system/controlcenter.service
+      register: controlcenter_service
+
+- name: Confluent services validation
+  block:
+    - name: Check for offline and under replicated partitions to be zero if its a kafka broker
+      script: confluent_tests.sh
+      register: kafka_checks
+      until: "'UnderReplicatedPartitions=0' in kafka_checks.stdout and 'OfflinePartitions=0' in kafka_checks.stdout"
+      retries: "{{ retries }}"
+      delay: "{{ delay_time }}"
+      when: kafka_service.stat.exists
+
+    - name: Execute confluent checks script to get all details to validate before proceeding with patch and reboot
+      script: confluent_tests.sh
+      register: confluent_tests
+
+- name: Stopping the services present on the host
+  block:
+    - name: Stop the control center service
+      service:
+        name: controlcenter
+        state: stopped
+      when: ( controlcenter_service.stat.exists )
+      register: stop_controlcenter
+
+    - name: Stop the connect service
+      service:
+        name: connect
+        state: stopped
+      when: ( connect_service.stat.exists ) and ( 'local_connect=1' in confluent_tests.stdout ) and ( 'ConnectorsStatus=1' in confluent_tests.stdout )
+      register: stop_connect
+
+    - name: Stop the zookeeper service
+      service:
+        name: zookeeper
+        state: stopped
+      when: ( zookeeper_service.stat.exists ) and ( 'local_zookeeper=1' in confluent_tests.stdout ) and ( 'ZookeepersOffline=0' in confluent_tests.stdout )
+      register: stop_zookeeper
+
+    - name: Stop the kafka service
+      service:
+        name: kafka
+        state: stopped
+      when: ( kafka_service.stat.exists ) and ( 'local_kafka=1' in confluent_tests.stdout ) and ( 'OfflinePartitions=0' in confluent_tests.stdout ) and ( 'UnderReplicatedPartitions=0' in confluent_tests.stdout ) and ( 'ZookeepersOffline=0' in confluent_tests.stdout )
+      register: stop_kafka
+
+- name: Patch the hosts afterr services have been stopped
+  shell: "curl -k -1 https://pulp1-dc1.worldpay.local/patch.sh | bash -s $(date +%Y' '%m)"
+  when: ( connect_service.stat.exists and stop_connect.changed ) or ( controlcenter_service.stat.exists and stop_controlcenter.changed ) or ( kafka_service.stat.exists and stop_kafka.changed )
+  register: first_patch_log
+
+- name: Repatch the host in case of known error
+  block:
+    - block:
+        - name: Clean the yum cache
+          shell: yum clean all
+
+        - name: Yum update the libtirpc-devel.x86_64 package which has issues
+          shell: yum update -y libtirpc-devel.x86_64 --nogpgcheck
+
+        - name: Re-patch the host
+          shell: "curl -k -1 https://pulp1-dc1.worldpay.local/patch.sh | bash -s $(date +%Y' '%m)"
+          register: repatch_log
+
+        - name: Error log
+          debug:
+            var: repatch_log
+          when: ( 'ERROR' in repatch_log.stdout )
+      when: ( 'ERROR with transaction check vs depsolve' in first_patch_log.stdout and 'libtirpc-devel' in first_patch_log.stdout )
+  when: ( first_patch_log.changed ) and ( 'ERROR' in first_patch_log.stdout )
+
+- name: Start the services in case of patching errors
+  block:
+    - name: Start the zookeeper service
+      service:
+        name: zookeeper
+        state: started
+      when: ( zookeeper_service.stat.exists )
+
+    - name: Start the kafka service
+      service:
+        name: kafka
+        state: stopped
+      when: ( kafka_service.stat.exists )
+
+    - name: Start the connect service
+      service:
+        name: connect
+        state: started
+      when: ( connect_service.stat.exists )
+
+    - name: Start the control center service
+      service:
+        name: controlcenter
+        state: started
+      when: ( controlcenter_service.stat.exists )
+  when: ( repatch_log.changed ) and ( 'ERROR' in repatch_log.stdout )
+
+- name: Reboot the host and wait for SSH
+  block:
+    - name: Reboot the server
+      shell: "sleep 5 && /usr/sbin/reboot && sleep 1"
+      async: 1
+      poll: 0
+      when: ( first_patch_log.changed ) or ( repatch_log.changed )
+      register: Reboot
+
+    - name: Wait for the host to reboot and become available over SSH
+      wait_for:
+        port: 22
+        host: '{{ (ansible_ssh_host|default(ansible_host))|default(inventory_hostname) }}'
+        search_regex: OpenSSH
+        delay: 30
+        sleep: 5
+        timeout: 360
+      become: no
+      connection: local
+      when: Reboot.changed
+
+    - name: Re-check for offline and under replicated partitions to be zero if its a kafka broker
+      script: confluent_tests.sh
+      register: latest_kafka_checks
+      until: "'UnderReplicatedPartitions=0' in latest_kafka_checks.stdout and 'OfflinePartitions=0' in latest_kafka_checks.stdout"
+      retries: "{{ retries }}"
+      delay: "{{ delay_time }}"
+      when: kafka_service.stat.exists
+  when: ( 'ERROR' not in first_patch_log.stdout ) or ( 'ERROR' not in repatch_log.stdout )
