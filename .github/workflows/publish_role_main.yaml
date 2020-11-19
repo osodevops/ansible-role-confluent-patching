@@ -1,5 +1,4 @@
 name: Publish role to Anisble Galaxy
-
 on:
   push:
     branches:
