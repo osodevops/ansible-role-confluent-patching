@@ -1,0 +1,14 @@
+---
+#
+# This is the canonical configuration for the `README.md`
+# Run `make readme` to rebuild the `README.md`
+#
+
+# Name of this project
+name: "ansible-role-confluent-patching"
+
+# Short description of this project
+description: |-
+ An structured way of OS patching Confluent running on Centos / RHEL / Amazon Linux
+# Canonical GitHub repo
+github_repo: osodevops/ansible-role-confluent-patching
